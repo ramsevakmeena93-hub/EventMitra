@@ -1,0 +1,1111 @@
+const express = require('express');
+const router = express.Router();
+const multer = require('multer');
+const path = require('path');
+const Event = require('../models/Event');
+const Venue = require('../models/Venue');
+const User = require('../models/User');
+const Club = require('../models/Club');
+const { auth, authorize } = require('../middleware/auth');
+const { sendEmail, emailTemplates } = require('../utils/email');
+const { emitEventUpdate, emitNotification } = require('../utils/socket');
+
+// Multer configuration for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, 'uploads/documents/');
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, 'event-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const fileFilter = (req, file, cb) => {
+  const allowedTypes = /pdf|doc|docx|jpg|jpeg|png/;
+  const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+  const mimetype = allowedTypes.test(file.mimetype);
+  
+  if (extname && mimetype) {
+    cb(null, true);
+  } else {
+    cb(new Error('Only PDF, DOC, DOCX, JPG, PNG files are allowed'));
+  }
+};
+
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  fileFilter: fileFilter
+});
+
+// Check venue availability
+router.post('/check-availability', auth, async (req, res) => {
+  try {
+    const { venueId, date, startTime, endTime, excludeEventId } = req.body;
+    
+    console.log('[check-availability] Request:', { venueId, date, startTime, endTime, excludeEventId });
+    
+    // Validate time is within allowed hours (8 AM to 6 PM)
+    const [startHour] = startTime.split(':').map(Number);
+    const [endHour, endMin] = endTime.split(':').map(Number);
+    
+    if (startHour < 8 || endHour > 18 || (endHour === 18 && endMin > 0)) {
+      return res.json({ 
+        available: false, 
+        message: 'Bookings are only allowed between 8:00 AM and 6:00 PM' 
+      });
+    }
+    
+    if (startTime >= endTime) {
+      return res.json({ 
+        available: false, 
+        message: 'End time must be after start time' 
+      });
+    }
+    
+    // Check for overlapping bookings
+    // Only check events that are NOT rejected or cancelled
+    const bookingDate = new Date(date);
+    bookingDate.setHours(0, 0, 0, 0); // Normalize to start of day
+    
+    const query = {
+      venueId,
+      date: bookingDate,
+      status: { 
+        $in: ['pending_hod', 'pending_abc', 'pending_superadmin', 'approved'] 
+      }
+    };
+    
+    // Exclude current event if editing
+    if (excludeEventId) {
+      query._id = { $ne: excludeEventId };
+    }
+    
+    const existingEvents = await Event.find(query);
+    
+    console.log(`[check-availability] Found ${existingEvents.length} existing bookings for this venue on this date`);
+
+    // Check for time overlap
+    for (const event of existingEvents) {
+      const existingStart = event.startTime;
+      const existingEnd = event.endTime;
+      
+      if (existingStart && existingEnd) {
+        // Check if times overlap
+        const hasOverlap = (
+          (startTime >= existingStart && startTime < existingEnd) ||
+          (endTime > existingStart && endTime <= existingEnd) ||
+          (startTime <= existingStart && endTime >= existingEnd)
+        );
+        
+        if (hasOverlap) {
+          console.log(`[check-availability] CONFLICT with event ${event._id}: ${existingStart} - ${existingEnd}`);
+          return res.json({ 
+            available: false, 
+            message: `Venue is already booked from ${existingStart} to ${existingEnd}. Please choose a different time slot.`,
+            conflictingEvent: {
+              startTime: existingStart,
+              endTime: existingEnd,
+              reason: event.reason
+            }
+          });
+        }
+      }
+    }
+
+    console.log('[check-availability] Venue is AVAILABLE');
+    res.json({ available: true, message: 'Venue is available' });
+  } catch (error) {
+    console.error('[check-availability] Error:', error);
+    res.status(500).json({ message: 'Server error while checking availability', error: error.message });
+  }
+});
+
+// Create event (Faculty creates for themselves)
+router.post('/create', auth, authorize('faculty'), upload.single('document'), async (req, res) => {
+  try {
+    console.log('[create-event] Starting event creation...');
+    console.log('[create-event] User:', req.user.name, '| Role:', req.user.role);
+    
+    // CHECK FOR PENDING FEEDBACK FIRST
+    const pendingFeedback = await Event.findOne({
+      facultyId: req.userId,
+      status: 'approved',
+      eventStatus: 'completed',
+      feedbackSubmitted: false
+    }).populate('venueId');
+
+    if (pendingFeedback) {
+      console.log('[create-event] BLOCKED: Faculty has pending feedback for event:', pendingFeedback._id);
+      return res.status(403).json({
+        message: 'Feedback submission for your previous event is mandatory before booking a new event.',
+        pendingEvent: {
+          _id: pendingFeedback._id,
+          reason: pendingFeedback.reason,
+          venue: pendingFeedback.venueId.name,
+          date: pendingFeedback.date,
+          completedAt: pendingFeedback.completedAt
+        },
+        requiresFeedback: true
+      });
+    }
+    
+    const { clubId, venueId, date, startTime, endTime, reason, eventDetails } = req.body;
+    const io = req.app.get('io');
+
+    console.log('[create-event] Request data:', { clubId, venueId, date, startTime, endTime, reason });
+
+    // Validate time is within allowed hours
+    const [startHour] = startTime.split(':').map(Number);
+    const [endHour, endMin] = endTime.split(':').map(Number);
+    
+    if (startHour < 8 || endHour > 18 || (endHour === 18 && endMin > 0)) {
+      console.log('[create-event] REJECTED: Time outside allowed hours');
+      return res.status(400).json({ 
+        message: 'Bookings are only allowed between 8:00 AM and 6:00 PM' 
+      });
+    }
+
+    // Check availability ONE MORE TIME before creating
+    const bookingDate = new Date(date);
+    bookingDate.setHours(0, 0, 0, 0);
+    
+    const existingEvents = await Event.find({
+      venueId,
+      date: bookingDate,
+      status: { $in: ['pending_hod', 'pending_abc', 'pending_superadmin', 'approved'] }
+    });
+
+    console.log(`[create-event] Found ${existingEvents.length} existing events for this venue/date`);
+
+    // Check for time overlap
+    for (const event of existingEvents) {
+      const existingStart = event.startTime;
+      const existingEnd = event.endTime;
+      
+      if (existingStart && existingEnd) {
+        const hasOverlap = (
+          (startTime >= existingStart && startTime < existingEnd) ||
+          (endTime > existingStart && endTime <= existingEnd) ||
+          (startTime <= existingStart && endTime >= existingEnd)
+        );
+        
+        if (hasOverlap) {
+          console.log(`[create-event] REJECTED: Time conflict with event ${event._id}`);
+          return res.status(400).json({ 
+            message: `Venue is already booked from ${existingStart} to ${existingEnd}. Please choose a different time.` 
+          });
+        }
+      }
+    }
+
+    const venue = await Venue.findById(venueId);
+    if (!venue) {
+      console.log('[create-event] REJECTED: Venue not found');
+      return res.status(404).json({ message: 'Venue not found' });
+    }
+
+    console.log('[create-event] Venue:', venue.name);
+
+    // Use faculty as the applicant
+    const faculty = req.user;
+
+    // Check if venue is a Seminar Hall (needs HOD approval)
+    const isSeminarHall = venue.name && venue.name.includes('Seminar Hall');
+    
+    let hod = null;
+    let initialStatus = 'pending_abc'; // Default: go to ABC directly
+    let currentApprover = 'abc';
+    
+    // Only get HOD if it's a Seminar Hall
+    if (isSeminarHall && venue.hodDepartment) {
+      hod = await User.findOne({ 
+        role: 'hod', 
+        department: venue.hodDepartment,
+        isActive: true 
+      });
+
+      if (!hod) {
+        console.log('[create-event] REJECTED: HOD not found for', venue.hodDepartment);
+        return res.status(404).json({ message: 'HOD not found for this seminar hall' });
+      }
+      
+      initialStatus = 'pending_hod'; // Seminar Halls go to HOD first
+      currentApprover = 'hod';
+      console.log('[create-event] Workflow: Faculty → HOD → ABC → Super Admin');
+    } else {
+      console.log('[create-event] Workflow: Faculty → ABC → Super Admin (HOD skipped)');
+    }
+
+    // Get club if provided
+    let club = null;
+    if (clubId) {
+      club = await Club.findById(clubId);
+    }
+
+    // Format time display
+    const formatTime = (timeStr) => {
+      const [hour, min] = timeStr.split(':').map(Number);
+      const period = hour >= 12 ? 'PM' : 'AM';
+      const displayHour = hour > 12 ? hour - 12 : hour === 0 ? 12 : hour;
+      return `${displayHour}:${min.toString().padStart(2, '0')} ${period}`;
+    };
+    const timeDisplay = `${formatTime(startTime)} - ${formatTime(endTime)}`;
+
+    const event = new Event({
+      studentId: req.userId, // Faculty is the applicant
+      studentName: faculty.name,
+      branch: faculty.department || 'Faculty',
+      enrollmentNo: faculty.email, // Use email as identifier
+      facultyId: req.userId,
+      hodId: hod ? hod._id : undefined,
+      clubId: clubId || undefined,
+      clubName: club ? club.name : undefined,
+      venueId,
+      date: bookingDate,
+      startTime,
+      endTime,
+      time: timeDisplay,
+      reason,
+      eventDetails,
+      documentUrl: req.file ? `/uploads/documents/${req.file.filename}` : undefined,
+      documentName: req.file ? req.file.originalname : undefined,
+      status: initialStatus, // Either 'pending_hod' or 'pending_abc'
+      currentApprover: currentApprover, // Either 'hod' or 'abc'
+      eventStatus: 'upcoming', // Set event status to upcoming by default
+      history: [{
+        action: 'submitted',
+        role: 'faculty',
+        userId: req.userId,
+        userName: req.user.name,
+        timestamp: new Date(),
+        reason: isSeminarHall ? 'Application submitted by faculty (Seminar Hall - requires HOD approval)' : 'Application submitted by faculty (Non-Seminar Hall - goes to ABC directly)'
+      }]
+    });
+
+    await event.save();
+    console.log('[create-event] Event saved to database:', event._id);
+
+    // Send emails (wrapped in try-catch to not block event creation)
+    try {
+      // Send email to faculty (applicant)
+      await sendEmail({
+        to: faculty.email,
+        subject: 'Event Application Submitted',
+        html: emailTemplates.eventSubmitted(faculty.name, {
+          venue: venue.name,
+          date: bookingDate.toLocaleDateString(),
+          time: timeDisplay,
+          reason
+        })
+      });
+      console.log('[create-event] Email sent to faculty');
+
+      // Send email to HOD only if it's a Seminar Hall
+      if (isSeminarHall && hod) {
+        await sendEmail({
+          to: hod.email,
+          subject: 'New Event Approval Required',
+          html: emailTemplates.pendingApproval(hod.name, 'HOD', faculty.name, {
+            venue: venue.name,
+            date: bookingDate.toLocaleDateString(),
+            time: timeDisplay,
+            reason
+          })
+        });
+        console.log('[create-event] Email sent to HOD');
+
+        // Emit notification to HOD
+        if (io) {
+          emitNotification(io, hod._id.toString(), {
+            type: 'new_event',
+            message: `New event approval required from ${faculty.name}`,
+            eventId: event._id
+          });
+        }
+      } else {
+        // For non-Seminar Halls, notify ABC directly
+        const abcUsers = await User.find({ role: 'abc', isActive: true });
+        console.log(`[create-event] Notifying ${abcUsers.length} ABC users`);
+        
+        for (const abc of abcUsers) {
+          await sendEmail({
+            to: abc.email,
+            subject: 'New Event Approval Required',
+            html: emailTemplates.pendingApproval(abc.name, 'ABC', faculty.name, {
+              venue: venue.name,
+              date: bookingDate.toLocaleDateString(),
+              time: timeDisplay,
+              reason
+            })
+          });
+
+          if (io) {
+            emitNotification(io, abc._id.toString(), {
+              type: 'new_event',
+              message: `New event approval required from ${faculty.name}`,
+              eventId: event._id
+            });
+          }
+        }
+      }
+    } catch (emailError) {
+      console.error('[create-event] Email sending failed (non-critical):', emailError.message);
+      // Don't fail the request if email fails
+    }
+
+    // Emit socket update (fixed - collect all relevant user IDs)
+    try {
+      if (io) {
+        const userIdsToNotify = [req.userId]; // Faculty
+        if (hod) userIdsToNotify.push(hod._id);
+        
+        // Add ABC users if not going to HOD first
+        if (!isSeminarHall) {
+          const abcUsers = await User.find({ role: 'abc', isActive: true });
+          abcUsers.forEach(abc => userIdsToNotify.push(abc._id));
+        }
+        
+        emitEventUpdate(io, userIdsToNotify, event);
+        console.log('[create-event] Socket notifications sent to', userIdsToNotify.length, 'users');
+      }
+    } catch (socketError) {
+      console.error('[create-event] Socket notification failed (non-critical):', socketError.message);
+    }
+
+    console.log('[create-event] SUCCESS - Event created:', event._id);
+    res.status(201).json({ 
+      message: 'Event application submitted successfully!', 
+      event,
+      workflow: isSeminarHall ? 'Seminar Hall - Goes to HOD first' : 'Non-Seminar Hall - Goes to ABC directly'
+    });
+  } catch (error) {
+    console.error('[create-event] CRITICAL ERROR:', error);
+    console.error('[create-event] Stack trace:', error.stack);
+    res.status(500).json({ 
+      message: 'Failed to create event. Please try again or contact support.', 
+      error: error.message 
+    });
+  }
+});
+
+module.exports = router;
+
+// Approve event
+router.post('/:id/approve', auth, async (req, res) => {
+  try {
+    const event = await Event.findById(req.params.id)
+      .populate('studentId', 'name email')
+      .populate('facultyId', 'name email')
+      .populate('venueId');
+    
+    if (!event) {
+      return res.status(404).json({ message: 'Event not found' });
+    }
+
+    const io = req.app.get('io');
+    const userRole = req.user.role;
+
+    // HOD approval
+    if (userRole === 'hod' && event.status === 'pending_hod') {
+      const abc = await User.findOne({ role: 'abc', isActive: true });
+
+      if (!abc) {
+        return res.status(404).json({ message: 'ABC not found' });
+      }
+
+      event.abcId = abc._id;
+      event.status = 'pending_abc';
+      event.currentApprover = 'abc';
+      event.history.push({
+        action: 'approved',
+        role: 'hod',
+        userId: req.userId,
+        userName: req.user.name,
+        timestamp: new Date()
+      });
+
+      await event.save();
+
+      try {
+        await sendEmail({
+          to: event.studentId.email,
+          subject: 'Event Approved by HOD',
+          html: emailTemplates.eventApproved(event.studentId.name, 'HOD', {
+            venue: event.venueId.name,
+            date: event.date.toLocaleDateString(),
+            time: event.time,
+            status: 'Pending ABC Approval'
+          })
+        });
+
+        await sendEmail({
+          to: abc.email,
+          subject: 'New Event Approval Required',
+          html: emailTemplates.pendingApproval(abc.name, 'ABC', event.studentId.name, {
+            venue: event.venueId.name,
+            date: event.date.toLocaleDateString(),
+            time: event.time,
+            reason: event.reason
+          })
+        });
+      } catch (emailError) {
+        console.error('[approve] Email sending failed (non-critical):', emailError.message);
+      }
+
+      if (io) {
+        emitEventUpdate(io, [event.studentId._id, abc._id], event);
+      }
+      return res.json({ message: 'Event approved and forwarded to ABC', event });
+    }
+
+    // ABC approval (with super admin selection OR final approval)
+    if (userRole === 'abc' && event.status === 'pending_abc') {
+      const { superAdminId, abcFinalApproval, comment } = req.body;
+
+      // ABC gives final approval directly
+      if (abcFinalApproval) {
+        event.status = 'approved';
+        event.currentApprover = null;
+        event.keyStatus = 'pending_collection';
+        event.abcId = req.userId;
+        event.history.push({
+          action: 'approved',
+          role: 'abc',
+          userId: req.userId,
+          userName: req.user.name,
+          reason: comment || 'Final approval by ABC (Ultimate Authority)',
+          timestamp: new Date()
+        });
+
+        await event.save();
+
+        try {
+          // Notify student
+          await sendEmail({
+            to: event.studentId.email,
+            subject: 'Event Finally Approved by ABC - Collect Key',
+            html: emailTemplates.eventApproved(event.studentId.name, 'ABC (Final Authority)', {
+              venue: event.venueId.name,
+              date: event.date.toLocaleDateString(),
+              time: event.time,
+              status: 'APPROVED - Please collect key from Registrar Office',
+              comment: comment || ''
+            })
+          });
+
+          // Notify Registrar
+          const registrar = await User.findOne({ role: 'registrar', isActive: true });
+          if (registrar) {
+            await sendEmail({
+              to: registrar.email,
+              subject: 'New Key Collection Pending',
+              html: `
+                <h2>Key Collection Required</h2>
+                <p>Dear ${registrar.name},</p>
+                <p>A new event has been approved and requires key collection:</p>
+                <ul>
+                  <li><strong>Student:</strong> ${event.studentId.name}</li>
+                  <li><strong>Venue:</strong> ${event.venueId.name}</li>
+                  <li><strong>Date:</strong> ${event.date.toLocaleDateString()}</li>
+                  <li><strong>Time:</strong> ${event.time}</li>
+                </ul>
+                <p>Please prepare the key for collection.</p>
+              `
+            });
+          }
+        } catch (emailError) {
+          console.error('[approve] Email sending failed (non-critical):', emailError.message);
+        }
+
+        if (io) {
+          emitEventUpdate(io, [event.studentId._id, event.facultyId, event.hodId], event);
+        }
+        return res.json({ message: 'Event finally approved by ABC', event });
+      }
+
+      // ABC forwards to Super Admin
+      if (!superAdminId) {
+        return res.status(400).json({ message: 'Super admin selection required' });
+      }
+
+      const superAdmin = await User.findById(superAdminId);
+      if (!superAdmin || superAdmin.role !== 'superadmin') {
+        return res.status(404).json({ message: 'Super admin not found' });
+      }
+
+      event.superAdminId = superAdminId;
+      event.abcId = req.userId;
+      event.status = 'pending_superadmin';
+      event.currentApprover = 'superadmin';
+      event.history.push({
+        action: 'approved',
+        role: 'abc',
+        userId: req.userId,
+        userName: req.user.name,
+        reason: comment || 'Approved and forwarded to Super Admin',
+        timestamp: new Date()
+      });
+
+      await event.save();
+
+      try {
+        await sendEmail({
+          to: event.studentId.email,
+          subject: 'Event Approved by ABC',
+          html: emailTemplates.eventApproved(event.studentId.name, 'ABC', {
+            venue: event.venueId.name,
+            date: event.date.toLocaleDateString(),
+            time: event.time,
+            status: 'Pending Super Admin Approval',
+            comment: comment || ''
+          })
+        });
+
+        await sendEmail({
+          to: superAdmin.email,
+          subject: 'New Event Approval Required',
+          html: emailTemplates.pendingApproval(superAdmin.name, 'Super Admin', event.studentId.name, {
+            venue: event.venueId.name,
+            date: event.date.toLocaleDateString(),
+            time: event.time,
+            reason: event.reason,
+            comment: comment || ''
+          })
+        });
+      } catch (emailError) {
+        console.error('[approve] Email sending failed (non-critical):', emailError.message);
+      }
+
+      if (io) {
+        emitEventUpdate(io, [event.studentId._id, superAdminId], event);
+      }
+      return res.json({ message: 'Event approved and forwarded to Super Admin', event });
+    }
+
+    // Super Admin final approval
+    if (userRole === 'superadmin' && event.status === 'pending_superadmin') {
+      event.status = 'approved';
+      event.currentApprover = null;
+      event.keyStatus = 'pending_collection';
+      event.history.push({
+        action: 'approved',
+        role: 'superadmin',
+        userId: req.userId,
+        userName: req.user.name,
+        timestamp: new Date()
+      });
+
+      await event.save();
+
+      try {
+        await sendEmail({
+          to: event.studentId.email,
+          subject: 'Event Finally Approved - Collect Key from Registrar',
+          html: emailTemplates.eventApproved(event.studentId.name, 'Super Admin', {
+            venue: event.venueId.name,
+            date: event.date.toLocaleDateString(),
+            time: event.time,
+            status: 'APPROVED - Please collect key from Registrar Office'
+          })
+        });
+      } catch (emailError) {
+        console.error('[approve] Email sending failed (non-critical):', emailError.message);
+      }
+
+      if (io) {
+        emitEventUpdate(io, [event.studentId._id, event.facultyId, event.hodId, event.abcId], event);
+      }
+      return res.json({ message: 'Event finally approved', event });
+    }
+
+    res.status(403).json({ message: 'Not authorized to approve at this stage' });
+  } catch (error) {
+    console.error('[approve] Error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Reject event
+router.post('/:id/reject', auth, async (req, res) => {
+  try {
+    const { reason } = req.body;
+    const event = await Event.findById(req.params.id)
+      .populate('studentId', 'name email')
+      .populate('venueId');
+
+    if (!event) {
+      return res.status(404).json({ message: 'Event not found' });
+    }
+
+    if (!reason) {
+      return res.status(400).json({ message: 'Rejection reason is required' });
+    }
+
+    const io = req.app.get('io');
+
+    event.status = 'rejected';
+    event.rejectionReason = reason;
+    event.currentApprover = null;
+    event.history.push({
+      action: 'rejected',
+      role: req.user.role,
+      userId: req.userId,
+      userName: req.user.name,
+      reason,
+      timestamp: new Date()
+    });
+
+    await event.save();
+
+    try {
+      await sendEmail({
+        to: event.studentId.email,
+        subject: 'Event Application Rejected',
+        html: emailTemplates.eventRejected(event.studentId.name, req.user.role.toUpperCase(), reason, {
+          venue: event.venueId.name,
+          date: event.date.toLocaleDateString(),
+          time: event.time
+        })
+      });
+    } catch (emailError) {
+      console.error('[reject] Email sending failed (non-critical):', emailError.message);
+    }
+
+    if (io) {
+      emitNotification(io, event.studentId._id, {
+        type: 'event_rejected',
+        message: `Your event application has been rejected by ${req.user.role}`,
+        eventId: event._id,
+        reason
+      });
+    }
+
+    res.json({ message: 'Event rejected', event });
+  } catch (error) {
+    console.error('[reject] Error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Get my events
+router.get('/my-events', auth, async (req, res) => {
+  try {
+    let query = {};
+
+    switch (req.user.role) {
+      case 'student':
+        query = { studentId: req.userId };
+        break;
+      case 'faculty':
+        query = { facultyId: req.userId };
+        break;
+      case 'hod':
+        query = { status: 'pending_hod' };
+        break;
+      case 'abc':
+        query = { status: 'pending_abc' };
+        break;
+      case 'superadmin':
+        query = { superAdminId: req.userId };
+        break;
+      case 'registrar':
+        query = { status: 'approved', keyStatus: { $in: ['pending_collection', 'collected'] } };
+        break;
+    }
+
+    const events = await Event.find(query)
+      .populate('studentId', 'name email branch enrollmentNo')
+      .populate('facultyId', 'name email')
+      .populate('hodId', 'name email')
+      .populate('abcId', 'name email')
+      .populate('superAdminId', 'name email')
+      .populate('venueId')
+      .populate('clubId', 'name')
+      .sort({ createdAt: -1 });
+
+    res.json(events);
+  } catch (error) {
+    console.error('[my-events] Error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Get pending approvals
+router.get('/pending', auth, async (req, res) => {
+  try {
+    let query = {};
+
+    switch (req.user.role) {
+      case 'hod':
+        query = { status: 'pending_hod' };
+        break;
+      case 'abc':
+        query = { status: 'pending_abc' };
+        break;
+      case 'superadmin':
+        query = { superAdminId: req.userId, status: 'pending_superadmin' };
+        break;
+      default:
+        return res.json([]);
+    }
+
+    const events = await Event.find(query)
+      .populate('studentId', 'name email branch enrollmentNo')
+      .populate('facultyId', 'name email')
+      .populate('venueId')
+      .populate('clubId', 'name')
+      .sort({ createdAt: -1 });
+
+    res.json(events);
+  } catch (error) {
+    console.error('[pending] Error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Get event by ID
+router.get('/:id', auth, async (req, res) => {
+  try {
+    const event = await Event.findById(req.params.id)
+      .populate('studentId', 'name email branch enrollmentNo')
+      .populate('facultyId', 'name email')
+      .populate('hodId', 'name email')
+      .populate('abcId', 'name email')
+      .populate('superAdminId', 'name email')
+      .populate('venueId')
+      .populate('clubId', 'name')
+      .populate('keyCollectedBy', 'name email')
+      .populate('keyReturnedTo', 'name email')
+      .populate('history.userId', 'name email');
+
+    if (!event) {
+      return res.status(404).json({ message: 'Event not found' });
+    }
+
+    res.json(event);
+  } catch (error) {
+    console.error('[get-event] Error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Get events pending key collection (for Registrar)
+router.get('/keys/pending', auth, authorize('registrar'), async (req, res) => {
+  try {
+    const events = await Event.find({
+      status: 'approved',
+      keyStatus: 'pending_collection'
+    })
+      .populate('studentId', 'name email branch enrollmentNo')
+      .populate('venueId')
+      .sort({ date: 1 });
+
+    res.json(events);
+  } catch (error) {
+    console.error('[keys-pending] Error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Get events with collected keys (for Registrar)
+router.get('/keys/collected', auth, authorize('registrar'), async (req, res) => {
+  try {
+    const events = await Event.find({
+      status: 'approved',
+      keyStatus: 'collected'
+    })
+      .populate('studentId', 'name email branch enrollmentNo')
+      .populate('venueId')
+      .populate('keyCollectedBy', 'name email')
+      .sort({ keyCollectedAt: -1 });
+
+    res.json(events);
+  } catch (error) {
+    console.error('[keys-collected] Error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Mark key as collected (Registrar)
+router.post('/:id/key-collected', auth, authorize('registrar'), async (req, res) => {
+  try {
+    const { notes } = req.body;
+    const event = await Event.findById(req.params.id)
+      .populate('studentId', 'name email')
+      .populate('venueId');
+
+    if (!event) {
+      return res.status(404).json({ message: 'Event not found' });
+    }
+
+    if (event.keyStatus !== 'pending_collection') {
+      return res.status(400).json({ message: 'Key is not pending collection' });
+    }
+
+    const io = req.app.get('io');
+
+    event.keyStatus = 'collected';
+    event.keyCollectedAt = new Date();
+    event.keyCollectedBy = req.userId;
+    event.keyNotes = notes || '';
+
+    event.history.push({
+      action: 'approved',
+      role: 'registrar',
+      userId: req.userId,
+      userName: req.user.name,
+      reason: 'Key collected by student',
+      timestamp: new Date()
+    });
+
+    await event.save();
+
+    try {
+      await sendEmail({
+        to: event.studentId.email,
+        subject: 'Key Collected - EventMitra',
+        html: `
+          <h2>Key Collected Successfully</h2>
+          <p>Dear ${event.studentId.name},</p>
+          <p>You have successfully collected the key for:</p>
+          <ul>
+            <li><strong>Venue:</strong> ${event.venueId.name}</li>
+            <li><strong>Date:</strong> ${event.date.toLocaleDateString()}</li>
+            <li><strong>Time:</strong> ${event.time}</li>
+          </ul>
+          <p><strong>Please return the key after your event.</strong></p>
+          ${notes ? `<p><strong>Notes:</strong> ${notes}</p>` : ''}
+        `
+      });
+    } catch (emailError) {
+      console.error('[key-collected] Email sending failed (non-critical):', emailError.message);
+    }
+
+    if (io) {
+      emitNotification(io, event.studentId._id, {
+        type: 'key_collected',
+        message: 'Key collected successfully. Please return after event.',
+        eventId: event._id
+      });
+    }
+
+    res.json({ message: 'Key marked as collected', event });
+  } catch (error) {
+    console.error('[key-collected] Error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Mark key as returned (Registrar)
+router.post('/:id/key-returned', auth, authorize('registrar'), async (req, res) => {
+  try {
+    const event = await Event.findById(req.params.id)
+      .populate('studentId', 'name email')
+      .populate('venueId');
+
+    if (!event) {
+      return res.status(404).json({ message: 'Event not found' });
+    }
+
+    if (event.keyStatus !== 'collected') {
+      return res.status(400).json({ message: 'Key is not collected yet' });
+    }
+
+    const io = req.app.get('io');
+
+    event.keyStatus = 'returned';
+    event.keyReturnedAt = new Date();
+    event.keyReturnedTo = req.userId;
+
+    event.history.push({
+      action: 'approved',
+      role: 'registrar',
+      userId: req.userId,
+      userName: req.user.name,
+      reason: 'Key returned by student',
+      timestamp: new Date()
+    });
+
+    await event.save();
+
+    try {
+      await sendEmail({
+        to: event.studentId.email,
+        subject: 'Key Returned - EventMitra',
+        html: `
+          <h2>Key Returned Successfully</h2>
+          <p>Dear ${event.studentId.name},</p>
+          <p>Thank you for returning the key for:</p>
+          <ul>
+            <li><strong>Venue:</strong> ${event.venueId.name}</li>
+            <li><strong>Date:</strong> ${event.date.toLocaleDateString()}</li>
+            <li><strong>Time:</strong> ${event.time}</li>
+          </ul>
+          <p>Your booking is now complete.</p>
+        `
+      });
+    } catch (emailError) {
+      console.error('[key-returned] Email sending failed (non-critical):', emailError.message);
+    }
+
+    if (io) {
+      emitNotification(io, event.studentId._id, {
+        type: 'key_returned',
+        message: 'Key returned successfully. Booking complete.',
+        eventId: event._id
+      });
+    }
+
+    res.json({ message: 'Key marked as returned', event });
+  } catch (error) {
+    console.error('[key-returned] Error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Mark event as completed (Registrar) - Triggers feedback requirement
+router.post('/:id/mark-completed', auth, authorize('registrar'), async (req, res) => {
+  try {
+    console.log('[mark-completed] Registrar marking event as completed:', req.params.id);
+    
+    const event = await Event.findById(req.params.id)
+      .populate('facultyId', 'name email')
+      .populate('studentId', 'name email')
+      .populate('venueId');
+
+    if (!event) {
+      console.log('[mark-completed] Event not found');
+      return res.status(404).json({ message: 'Event not found' });
+    }
+
+    if (event.status !== 'approved') {
+      console.log('[mark-completed] Event not approved');
+      return res.status(400).json({ message: 'Only approved events can be marked as completed' });
+    }
+
+    if (event.eventStatus === 'completed') {
+      console.log('[mark-completed] Event already completed');
+      return res.status(400).json({ message: 'Event is already marked as completed' });
+    }
+
+    const io = req.app.get('io');
+    const now = new Date();
+
+    // Mark event as completed
+    event.eventStatus = 'completed';
+    event.completedAt = now;
+    event.history.push({
+      action: 'approved',
+      role: 'registrar',
+      userId: req.userId,
+      userName: req.user.name,
+      reason: 'Event marked as completed by Registrar',
+      timestamp: now
+    });
+
+    await event.save();
+    console.log('[mark-completed] Event marked as completed successfully');
+
+    // Send notification to faculty to submit feedback
+    const facultyEmail = event.facultyId?.email || event.studentId?.email;
+    const facultyName = event.facultyId?.name || event.studentId?.name;
+    const facultyId = event.facultyId?._id || event.studentId?._id;
+
+    if (facultyEmail && facultyName) {
+      try {
+        await sendEmail({
+          to: facultyEmail,
+          subject: 'Event Completed - Feedback Required',
+          html: `
+            <h2>Event Completed</h2>
+            <p>Dear ${facultyName},</p>
+            <p>Your event has been marked as completed by the Registrar:</p>
+            <ul>
+              <li><strong>Event:</strong> ${event.reason}</li>
+              <li><strong>Venue:</strong> ${event.venueId.name}</li>
+              <li><strong>Date:</strong> ${event.date.toLocaleDateString()}</li>
+              <li><strong>Time:</strong> ${event.time}</li>
+            </ul>
+            <p><strong>⚠️ IMPORTANT: Please submit your event feedback form.</strong></p>
+            <p>You will not be able to book new events until feedback is submitted.</p>
+            <p>Login to EventMitra to submit your feedback.</p>
+          `
+        });
+        console.log('[mark-completed] Feedback notification email sent to:', facultyEmail);
+      } catch (emailError) {
+        console.error('[mark-completed] Email failed:', emailError.message);
+      }
+
+      // Send socket notification
+      if (io && facultyId) {
+        emitNotification(io, facultyId.toString(), {
+          type: 'event_completed',
+          message: 'Your event has been completed. Please submit feedback.',
+          eventId: event._id,
+          timestamp: now
+        });
+        console.log('[mark-completed] Socket notification sent');
+      }
+    }
+
+    res.json({ 
+      message: 'Event marked as completed. Faculty has been notified to submit feedback.', 
+      event 
+    });
+  } catch (error) {
+    console.error('[mark-completed] Error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Get all events (for students to view all college events)
+router.get('/all', auth, async (req, res) => {
+  try {
+    const events = await Event.find({})
+      .populate('studentId', 'name email branch enrollmentNo')
+      .populate('facultyId', 'name email department')
+      .populate('hodId', 'name email department')
+      .populate('abcId', 'name email')
+      .populate('superAdminId', 'name email')
+      .populate('venueId')
+      .populate('clubId', 'name')
+      .sort({ createdAt: -1 })
+      .limit(100);
+    
+    res.json(events);
+  } catch (error) {
+    console.error('[all-events] Error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+
+// Get all approved upcoming/ongoing events (PUBLIC - visible to everyone)
+router.get('/public/approved', async (req, res) => {
+  try {
+    console.log('[public-approved] Fetching approved events...');
+    
+    const events = await Event.find({
+      status: 'approved',
+      eventStatus: { $in: ['upcoming', 'ongoing'] }
+    })
+      .populate('studentId', 'name email branch enrollmentNo')
+      .populate('facultyId', 'name email department')
+      .populate('venueId')
+      .populate('clubId', 'name')
+      .sort({ date: 1, startTime: 1 })
+      .limit(50);
+
+    console.log(`[public-approved] Found ${events.length} approved events`);
+    events.forEach(e => {
+      console.log(`  - ${e.reason} | status: ${e.status} | eventStatus: ${e.eventStatus} | date: ${e.date}`);
+    });
+
+    res.json(events);
+  } catch (error) {
+    console.error('[public-approved-events] Error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});

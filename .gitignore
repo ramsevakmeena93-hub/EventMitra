@@ -1,0 +1,154 @@
+# Dependencies
+node_modules/
+client/node_modules/
+server/node_modules/
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Build outputs
+client/dist/
+client/build/
+server/dist/
+server/build/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+.temp/
+
+# AI-generated summary and documentation files (development only)
+*_SUMMARY.md
+*_COMPLETE.md
+*_FIXED.md
+*_FEATURE.md
+*_IMPLEMENTED.md
+*_UPDATED.md
+*_SYSTEM.md
+*_GUIDE.md
+*_INSTRUCTIONS.md
+*_CHECKLIST.md
+*_REFERENCE.txt
+*_COMMANDS.txt
+*_CREDENTIALS.txt
+COMPLETE_PROJECT_SUMMARY.md
+PROJECT_COMPLETE.md
+TASK_*.md
+ABC_*.md
+ALL_*.md
+APPLYEVENT_*.md
+APPLYEVENT_*.jsx
+BOOKING_TRACKER_*.md
+CLEAR_*.md
+CLUB_*.md
+CLUBS_*.md
+CREATE_EVENT_*.md
+DEVELOPER_PAGE_*.md
+EMAIL_NOTIFICATIONS_*.md
+EVENT_*.md
+EVENTMITRA_*.md
+FACULTY_*.md
+FINAL_*.txt
+FIX_*.md
+GET_STARTED.md
+GOOGLE_*.md
+GOOGLE_*.txt
+HOD_*.md
+HOME_PAGE_*.md
+KEY_MANAGEMENT_*.md
+LOCALHOST_*.md
+LOGIN_*.md
+LOGIN_*.txt
+MONGODB_*.md
+PAGES_*.md
+PROJECT_FILES.txt
+QUICK_*.md
+QUICK_*.txt
+QUICKSTART.md
+REGISTRAR_*.md
+SETUP_*.md
+SOCKET_*.md
+SOCKET_*.txt
+START_HERE.md
+STUDENT_*.md
+SUMMARY.txt
+SUPERADMIN_*.md
+SYSTEM_*.md
+TIME_*.md
+UPDATED_*.md
+USER_*.md
+VENUE_*.md
+VENUES_*.md
+WORKFLOW_*.md
+CHECKLIST.md
+🎉_READ_ME_FIRST.txt
+~$*.md
+
+# Test files (development only)
+test-*.js
+test-*.html
+testLogin*.js
+testEvent*.js
+checkEvents.js
+
+# Server utility/migration scripts (development only)
+server/fix*.js
+server/update*.js
+server/simplify*.js
+server/remove*.js
+server/link*.js
+server/seed*.js
+
+# Backup files
+*_BACKUP.*
+*_OLD.*
+*_FIXED.*
+*_NEW.*
+server/routes/*_BACKUP.js
+server/routes/*_FIXED.js
+client/src/pages/*_FIXED.jsx
+client/src/pages/*_NEW.jsx
+
+# Utility scripts (development only - keep start scripts)
+install.sh
+install.bat
+SETUP_AND_RUN.bat
+START_APPLICATION.bat
+
+# Uploads (if contains user data)
+uploads/
+server/uploads/
+
+# Package lock files (optional - uncomment if needed)
+# package-lock.json
+# client/package-lock.json
+# server/package-lock.json

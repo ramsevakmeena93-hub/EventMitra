@@ -1,23 +1,24 @@
 services:
-  # Backend + Frontend (Combined Deployment)
+  # Backend API Service
   - type: web
-    name: eventmitra
+    name: eventmitra-api
     env: node
-    region: singapore
+    region: oregon
     plan: free
-    buildCommand: npm install && npm run build
-    startCommand: npm start
+    buildCommand: npm install
+    startCommand: node server/index.js
+    healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
-        value: 10000
+        value: 5000
       - key: MONGODB_URI
         sync: false
       - key: JWT_SECRET
         generateValue: true
-      - key: JWT_EXPIRE
-        value: 7d
+      - key: CLIENT_URL
+        value: https://eventmitra.onrender.com
       - key: EMAIL_HOST
         value: smtp.gmail.com
       - key: EMAIL_PORT
@@ -26,9 +27,16 @@ services:
         sync: false
       - key: EMAIL_PASS
         sync: false
-      - key: CLIENT_URL
-        value: https://eventmitra.onrender.com
-      - key: GOOGLE_CLIENT_ID
-        sync: false
-      - key: GOOGLE_CLIENT_SECRET
-        sync: false
+
+  # Frontend Service
+  - type: web
+    name: eventmitra
+    env: node
+    region: oregon
+    plan: free
+    rootDir: client
+    buildCommand: npm install && npm run build
+    startCommand: npm run preview
+    envVars:
+      - key: VITE_API_URL
+        value: https://eventmitra-api.onrender.com
